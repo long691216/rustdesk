@@ -1,0 +1,736 @@
+name: Build RustDesk Windows x64 - RITZTECH
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.75"
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  VERSION: "1.4.9"
+
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+
+  RENDEZVOUS_SERVER: "rustdesk.ritztech.com.tw"
+
+jobs:
+
+  # ============================================================
+  # Generate Flutter Rust Bridge
+  # ============================================================
+
+  generate-bridge:
+    name: Generate Flutter Rust Bridge
+    uses: ./.github/workflows/bridge.yml
+
+
+  # ============================================================
+  # Build RustDeskTempTopMostWindow
+  # ============================================================
+
+  build-RustDeskTempTopMostWindow:
+    name: Build RustDeskTempTopMostWindow
+
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+
+    with:
+      upload-artifact: true
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+
+
+  # ============================================================
+  # Windows x64
+  # ============================================================
+
+  build-windows-x64:
+    name: Build RustDesk Windows x64
+
+    needs:
+      - generate-bridge
+      - build-RustDeskTempTopMostWindow
+
+    runs-on: windows-2022
+
+    steps:
+
+      # ========================================================
+      # GitHub Actions Cache
+      # ========================================================
+
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+        with:
+          script: |
+            core.exportVariable(
+              'ACTIONS_CACHE_URL',
+              process.env.ACTIONS_CACHE_URL || ''
+            );
+            core.exportVariable(
+              'ACTIONS_RUNTIME_TOKEN',
+              process.env.ACTIONS_RUNTIME_TOKEN || ''
+            );
+
+
+      # ========================================================
+      # Checkout
+      # ========================================================
+
+      - name: Checkout source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          submodules: recursive
+
+
+      # ========================================================
+      # Download Bridge
+      # ========================================================
+
+      - name: Download bridge artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: bridge-artifact
+          path: ./
+
+
+      # ========================================================
+      # Install LLVM
+      # ========================================================
+
+      - name: Install LLVM
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+
+      # ========================================================
+      # Install Flutter
+      # ========================================================
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+
+
+      # ========================================================
+      # Flutter Doctor
+      # ========================================================
+
+      - name: Flutter Doctor
+        shell: powershell
+        run: |
+          flutter doctor -v
+
+
+      # ========================================================
+      # Flutter Windows Engine
+      # ========================================================
+
+      - name: Install RustDesk Flutter engine
+        shell: powershell
+        run: |
+
+          flutter precache --windows
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip" `
+            -OutFile "windows-x64-release.zip"
+
+          if (!(Test-Path "windows-x64-release.zip")) {
+            Write-Error "RustDesk Flutter engine download failed."
+            exit 1
+          }
+
+          if (Test-Path "windows-x64-release") {
+            Remove-Item `
+              "windows-x64-release" `
+              -Recurse `
+              -Force
+          }
+
+          Expand-Archive `
+            -Path "windows-x64-release.zip" `
+            -DestinationPath "windows-x64-release" `
+            -Force
+
+          $enginePath = "C:\hostedtoolcache\windows\flutter\stable-${{ env.FLUTTER_VERSION }}-x64\bin\cache\artifacts\engine\windows-x64-release"
+
+          if (!(Test-Path $enginePath)) {
+            Write-Error "Flutter engine directory not found."
+            Write-Error $enginePath
+            exit 1
+          }
+
+          Copy-Item `
+            "windows-x64-release\*" `
+            $enginePath `
+            -Recurse `
+            -Force
+
+
+      # ========================================================
+      # Patch Flutter
+      # ========================================================
+
+      - name: Patch Flutter
+        shell: bash
+        run: |
+
+          FLUTTER_ROOT="$(dirname "$(dirname "$(which flutter)")")"
+
+          if [ ! -f ".github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff" ]; then
+            echo "Flutter patch file not found."
+            exit 1
+          fi
+
+          cp \
+            ".github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff" \
+            "$FLUTTER_ROOT/"
+
+          cd "$FLUTTER_ROOT"
+
+          git apply \
+            "flutter_3.24.4_dropdown_menu_enableFilter.diff"
+
+
+      # ========================================================
+      # Install Rust
+      # ========================================================
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt
+
+
+      # ========================================================
+      # Rust Cache
+      # ========================================================
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          prefix-key: windows-2022
+
+
+      # ========================================================
+      # Setup vcpkg
+      # ========================================================
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+
+      # ========================================================
+      # Install vcpkg Dependencies
+      # ========================================================
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        run: |
+
+          if ! "$VCPKG_ROOT/vcpkg" \
+            install \
+            --triplet x64-windows-static \
+            --x-install-root="$VCPKG_ROOT/installed"
+          then
+
+            find "${VCPKG_ROOT}/" \
+              -name "*.log" |
+              while read -r log
+              do
+                echo "========================================"
+                echo "$log"
+                echo "========================================"
+                cat "$log"
+              done
+
+            exit 1
+          fi
+
+
+      # ========================================================
+      # RITZTECH Configuration
+      # ========================================================
+
+      - name: Configure RITZTECH Server
+        shell: powershell
+        env:
+          RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
+        run: |
+
+          Write-Host ""
+          Write-Host "============================================"
+          Write-Host " RITZTECH RustDesk Configuration"
+          Write-Host "============================================"
+          Write-Host ""
+
+          $configFile = ".\libs\hbb_common\src\config.rs"
+
+          # ----------------------------------------------------
+          # Check config.rs
+          # ----------------------------------------------------
+
+          if (!(Test-Path $configFile)) {
+            Write-Error "config.rs not found:"
+            Write-Error $configFile
+            exit 1
+          }
+
+          Write-Host "Config:"
+          Write-Host $configFile
+
+
+          # ----------------------------------------------------
+          # Check Server
+          # ----------------------------------------------------
+
+          $server = "${{ env.RENDEZVOUS_SERVER }}"
+
+          if ([string]::IsNullOrWhiteSpace($server)) {
+            Write-Error "RENDEZVOUS_SERVER is empty."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "RENDEZVOUS_SERVER:"
+          Write-Host $server
+
+
+          # ----------------------------------------------------
+          # Check Public Key
+          # ----------------------------------------------------
+
+          if ([string]::IsNullOrWhiteSpace($env:RS_PUB_KEY)) {
+            Write-Error "RS_PUB_KEY GitHub Secret is empty."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "RS_PUB_KEY:"
+          Write-Host "(configured)"
+
+
+          # ----------------------------------------------------
+          # Backup config.rs
+          # ----------------------------------------------------
+
+          Copy-Item `
+            $configFile `
+            "$configFile.backup" `
+            -Force
+
+
+          # ----------------------------------------------------
+          # Read config.rs
+          # ----------------------------------------------------
+
+          $content = Get-Content `
+            $configFile `
+            -Raw `
+            -Encoding UTF8
+
+
+          # ====================================================
+          # Replace RENDEZVOUS_SERVERS
+          # ====================================================
+
+          $serverPattern = 'pub\s+const\s+RENDEZVOUS_SERVERS\s*:\s*&\[&str\]\s*=\s*&\[.*?\];'
+
+          $serverReplacement = 'pub const RENDEZVOUS_SERVERS: &[&str] = &["' + $server + '"];'
+
+          $newContent = [regex]::Replace(
+            $content,
+            $serverPattern,
+            $serverReplacement
+          )
+
+
+          if ($newContent -eq $content) {
+            Write-Error "RENDEZVOUS_SERVERS was not found."
+            exit 1
+          }
+
+
+          # ====================================================
+          # Replace RS_PUB_KEY
+          # ====================================================
+
+          $keyPattern = 'pub\s+const\s+RS_PUB_KEY\s*:\s*&str\s*=\s*"[^"]*";'
+
+          $keyReplacement = 'pub const RS_PUB_KEY: &str = "' + $env:RS_PUB_KEY + '";'
+
+          $newContent2 = [regex]::Replace(
+            $newContent,
+            $keyPattern,
+            $keyReplacement
+          )
+
+
+          if ($newContent2 -eq $newContent) {
+            Write-Error "RS_PUB_KEY was not found."
+            exit 1
+          }
+
+
+          # ====================================================
+          # Write config.rs
+          # ====================================================
+
+          Set-Content `
+            -Path $configFile `
+            -Value $newContent2 `
+            -Encoding UTF8
+
+
+          # ====================================================
+          # Verify
+          # ====================================================
+
+          $verify = Get-Content `
+            $configFile `
+            -Raw `
+            -Encoding UTF8
+
+
+          if ($verify -notmatch "rustdesk\.ritztech\.com\.tw") {
+            Write-Error "Server configuration verification failed."
+            exit 1
+          }
+
+
+          if ($verify -notmatch 'pub\s+const\s+RS_PUB_KEY\s*:\s*&str\s*=') {
+            Write-Error "RS_PUB_KEY verification failed."
+            exit 1
+          }
+
+
+          Write-Host ""
+          Write-Host "============================================"
+          Write-Host " RITZTECH configuration OK"
+          Write-Host "============================================"
+          Write-Host ""
+          Write-Host "Server:"
+          Write-Host "rustdesk.ritztech.com.tw"
+          Write-Host ""
+          Write-Host "Public Key:"
+          Write-Host "Configured"
+          Write-Host ""
+
+
+      # ========================================================
+      # Show Config
+      # 不顯示 RS_PUB_KEY，避免洩漏
+      # ========================================================
+
+      - name: Verify RITZTECH configuration
+        shell: powershell
+        run: |
+
+          $configFile = ".\libs\hbb_common\src\config.rs"
+
+          $content = Get-Content `
+            $configFile `
+            -Raw `
+            -Encoding UTF8
+
+          Write-Host ""
+          Write-Host "RENDEZVOUS configuration:"
+          Write-Host ""
+
+          $serverLine = $content `
+            -split "`r?`n" |
+            Where-Object {
+              $_ -match "RENDEZVOUS_SERVERS"
+            } |
+            Select-Object -First 1
+
+          if ($serverLine) {
+            Write-Host $serverLine
+          }
+          else {
+            Write-Error "RENDEZVOUS_SERVERS not found."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "RS_PUB_KEY configured: YES"
+
+
+      # ========================================================
+      # Build RustDesk
+      # ========================================================
+
+      - name: Build RustDesk
+        shell: powershell
+        run: |
+
+          Write-Host ""
+          Write-Host "============================================"
+          Write-Host " Building RustDesk ${{ env.VERSION }}"
+          Write-Host "============================================"
+          Write-Host ""
+
+          python3 .\build.py `
+            --portable `
+            --flutter `
+            --skip-portable-pack `
+            --hwcodec `
+            --vram
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "RustDesk build failed."
+            exit 1
+          }
+
+
+      # ========================================================
+      # Prepare Release
+      # ========================================================
+
+      - name: Prepare RustDesk release
+        shell: powershell
+        run: |
+
+          $source = ".\flutter\build\windows\x64\runner\Release"
+          $target = ".\rustdesk"
+
+          if (!(Test-Path $source)) {
+            Write-Error "RustDesk release directory not found:"
+            Write-Error $source
+            exit 1
+          }
+
+          if (Test-Path $target) {
+            Remove-Item `
+              $target `
+              -Recurse `
+              -Force
+          }
+
+          Move-Item `
+            $source `
+            $target
+
+          if (!(Test-Path ".\rustdesk\rustdesk.exe")) {
+            Write-Error "rustdesk.exe not found."
+            exit 1
+          }
+
+
+      # ========================================================
+      # USB Virtual Display
+      # ========================================================
+
+      - name: Add USB virtual display
+        shell: powershell
+        run: |
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip" `
+            -OutFile "usbmmidd_v2.zip"
+
+          if (!(Test-Path "usbmmidd_v2.zip")) {
+            Write-Error "usbmmidd_v2.zip download failed."
+            exit 1
+          }
+
+          Expand-Archive `
+            "usbmmidd_v2.zip" `
+            -DestinationPath "." `
+            -Force
+
+          $usbDir = ".\usbmmidd_v2"
+
+          if (!(Test-Path $usbDir)) {
+            Write-Error "usbmmidd_v2 directory not found."
+            exit 1
+          }
+
+          Remove-Item `
+            "$usbDir\Win32" `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Remove-Item `
+            "$usbDir\deviceinstaller64.exe" `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Remove-Item `
+            "$usbDir\deviceinstaller.exe" `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Remove-Item `
+            "$usbDir\usbmmidd.bat" `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Copy-Item `
+            "$usbDir\*" `
+            ".\rustdesk\" `
+            -Recurse `
+            -Force
+
+
+      # ========================================================
+      # Download TopMostWindow
+      # ========================================================
+
+      - name: Download TopMostWindow
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: topmostwindow-artifacts-x64
+          path: .\topmostwindow
+
+
+      # ========================================================
+      # Install WindowInjection.dll
+      # ========================================================
+
+      - name: Install WindowInjection.dll
+        shell: powershell
+        run: |
+
+          $dll = Get-ChildItem `
+            ".\topmostwindow" `
+            -Filter "WindowInjection.dll" `
+            -Recurse `
+            -File |
+            Select-Object -First 1
+
+          if ($null -eq $dll) {
+
+            Write-Error "WindowInjection.dll not found."
+
+            Write-Host ""
+            Write-Host "Artifact contents:"
+            Write-Host ""
+
+            Get-ChildItem `
+              ".\topmostwindow" `
+              -Recurse |
+              Select-Object FullName
+
+            exit 1
+          }
+
+          Copy-Item `
+            $dll.FullName `
+            ".\rustdesk\WindowInjection.dll" `
+            -Force
+
+          Write-Host ""
+          Write-Host "WindowInjection.dll installed:"
+          Write-Host $dll.FullName
+
+
+      # ========================================================
+      # Verify Build
+      # ========================================================
+
+      - name: Verify build
+        shell: powershell
+        run: |
+
+          $exe = ".\rustdesk\rustdesk.exe"
+          $dll = ".\rustdesk\WindowInjection.dll"
+
+          if (!(Test-Path $exe)) {
+            Write-Error "rustdesk.exe missing."
+            exit 1
+          }
+
+          if (!(Test-Path $dll)) {
+            Write-Error "WindowInjection.dll missing."
+            exit 1
+          }
+
+          $exeFile = Get-Item $exe
+
+          Write-Host ""
+          Write-Host "============================================"
+          Write-Host " BUILD SUCCESS"
+          Write-Host "============================================"
+          Write-Host ""
+          Write-Host "RustDesk version:"
+          Write-Host "${{ env.VERSION }}"
+          Write-Host ""
+          Write-Host "Rendezvous server:"
+          Write-Host "${{ env.RENDEZVOUS_SERVER }}"
+          Write-Host ""
+          Write-Host "Executable:"
+          Write-Host $exe
+          Write-Host ""
+          Write-Host "EXE size:"
+          Write-Host "$([math]::Round($exeFile.Length / 1MB, 2)) MB"
+
+
+      # ========================================================
+      # Create ZIP
+      # ========================================================
+
+      - name: Create ZIP
+        shell: powershell
+        run: |
+
+          if (Test-Path ".\RustDesk-Windows-x64-RITZTECH.zip") {
+            Remove-Item `
+              ".\RustDesk-Windows-x64-RITZTECH.zip" `
+              -Force
+          }
+
+          Compress-Archive `
+            -Path ".\rustdesk\*" `
+            -DestinationPath ".\RustDesk-Windows-x64-RITZTECH.zip" `
+            -CompressionLevel Optimal
+
+          if (!(Test-Path ".\RustDesk-Windows-x64-RITZTECH.zip")) {
+            Write-Error "ZIP creation failed."
+            exit 1
+          }
+
+
+      # ========================================================
+      # Upload ZIP
+      # ========================================================
+
+      - name: Upload RustDesk ZIP
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: RustDesk-Windows-x64-RITZTECH
+          path: .\RustDesk-Windows-x64-RITZTECH.zip
+          if-no-files-found: error
+          retention-days: 30
+
+
+      # ========================================================
+      # Upload Complete Client
+      # ========================================================
+
+      - name: Upload RustDesk Windows Client
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: RustDesk-Windows-x64-RITZTECH-Files
+          path: .\rustdesk\
+          if-no-files-found: error
+          retention-days: 30
